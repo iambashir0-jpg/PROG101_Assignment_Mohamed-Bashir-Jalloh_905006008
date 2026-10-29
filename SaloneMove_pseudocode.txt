@@ -1,0 +1,403 @@
+PROGRAM SaloneMove
+// Commuter Fare Check and Reporting System for Freetown
+// PROG101 Principles of Programming Logic and Design
+
+// Conventions: ← assigns a value, = compares, ≠ means "not equal".
+// Arrays start at index 0. DISPLAY shows REAL values to 2 decimal places.
+// Every INPUT arrives as text. AND and OR stop as soon as the result is known.
+// Built-in routines: LENGTH(x), SUBSTRING(text, start, count), UPPERCASE(text),
+// TRIM(text) (removes spaces at either end), REMOVE_SPACES(text), IsAllDigits(text),
+// IsNumber(text) (TRUE for 10, 6.10 or -3), IsLettersAndDigits(text),
+// IsLettersAndSpaces(text), TO_INTEGER(text), TO_REAL(text), CONTAINS(list, value),
+// ROUND(number, places) (0 places gives a whole number), ABS(number),
+// PAD_LEFT(number, width, character), RANDOM_INTEGER(low, high), YEAR(dateTime)
+// (the year as text), SECONDS_BETWEEN(start, end), GetCurrentDateTime(),
+// HASH(text) (one-way, so PINs are never stored).
+// SendSMS(phone, message) is provided by the mobile network's SMS gateway;
+// it returns TRUE if the gateway accepted the message.
+
+// ======================= CONSTANTS ========================
+CONSTANT MAX_LOGIN_ATTEMPTS = 3 // INTEGER, tries for the phone number, code and PIN
+CONSTANT PHONE_LENGTH = 9 // INTEGER, e.g. 076123456
+CONSTANT CODE_EXPIRY_SECONDS = 300 // INTEGER, a one-time code lasts 5 minutes
+CONSTANT MIN_PLACE_LENGTH = 2 // INTEGER, shortest place name accepted
+CONSTANT FARE_TOLERANCE = 0.50 // REAL, NLe allowed either way for lack of small change
+CONSTANT SERIOUS_PERCENT = 50 // REAL, overcharge % that counts as serious
+CONSTANT MAX_AMOUNT_FACTOR = 10 // REAL, amount paid may be at most 10 × the fare
+CONSTANT HOTSPOT_THRESHOLD = 3 // INTEGER, open complaints per route
+CONSTANT MAX_FARE_CHANGE = 50 // REAL, largest % change accepted
+
+// ======================== RECORDS =========================
+RECORD FareRecord
+    route : STRING // e.g. "Lumley - Regent Road"
+    vehicleType : STRING // "PODA", "KEKE" or "OKADA"
+    officialFare : REAL // in New Leones (NLe)
+END RECORD
+
+RECORD Complaint
+    referenceID : STRING
+    phoneNumber : STRING // verified number of the person reporting
+    plateNumber : STRING // "0" if the plate was not seen
+    route : STRING
+    category : STRING
+    amountCharged : REAL
+    fareStatus : STRING // result of the fare check, e.g. "OVERCHARGED"
+    dateTime : DATETIME
+    status : STRING // "OPEN" or "CLOSED"
+END RECORD
+
+// ====================== GLOBAL DATA =======================
+// fareTable, routeList, complaints, validPrefixes, lockedNumbers,
+// officerPINHash and reportCounter are loaded from the database at start-up.
+DECLARE fareTable : ARRAY OF FareRecord
+DECLARE routeList : ARRAY OF STRING // every route in fareTable, listed once
+DECLARE complaints : ARRAY OF Complaint
+DECLARE validPrefixes : ARRAY OF STRING // mobile prefixes, e.g. "076", "088"
+DECLARE lockedNumbers : ARRAY OF STRING // numbers locked out of the officer portal
+DECLARE officerPINHash : STRING
+DECLARE reportCounter : INTEGER // number of reports issued so far
+DECLARE vehicleTypes : ARRAY OF STRING
+DECLARE categories : ARRAY OF STRING
+vehicleTypes ← ["PODA", "KEKE", "OKADA"]
+categories ← ["Overcharging", "Short-routing", "Reckless driving", "Harassment", "Overloading"]
+
+// =============== MAIN PROGRAM (Flowchart 1) ===============
+MODULE Main()
+    DECLARE phone : STRING
+    DECLARE choice, attempts : INTEGER
+    DECLARE isValid, isVerified, running : BOOLEAN
+    attempts ← 0
+    isValid ← FALSE
+    DISPLAY "Welcome to SaloneMove"
+    // Step 1, validation: is the number correctly formed?
+    WHILE attempts < MAX_LOGIN_ATTEMPTS AND isValid = FALSE DO
+        DISPLAY "Enter your phone number (e.g. 076123456):"
+        INPUT phone
+        IF IsValidPhone(phone) THEN
+            isValid ← TRUE
+        ELSE
+            attempts ← attempts + 1
+            DISPLAY "Invalid number. Attempts left: ", MAX_LOGIN_ATTEMPTS - attempts
+        END IF
+    END WHILE
+    IF isValid = FALSE THEN
+        DISPLAY "Too many invalid attempts. Session ended."
+    ELSE
+        isVerified ← VerifyPhone(phone) // Step 2, verification: one-time code by SMS
+        IF isVerified = FALSE THEN
+            DISPLAY "Phone number not verified. Session ended."
+        ELSE
+            running ← TRUE
+            WHILE running = TRUE DO
+                DISPLAY "1. Check a Fare / Report a Problem"
+                DISPLAY "2. Officer Login"
+                DISPLAY "0. Exit"
+                choice ← ReadChoice(0, 2)
+                CASE choice OF
+                    1: CheckFare(phone)
+                    2: OfficerPortal(phone)
+                    0: running ← FALSE
+                END CASE
+            END WHILE
+            DISPLAY "Thank you for using SaloneMove. Waka fine!"
+        END IF
+    END IF
+END MODULE
+
+FUNCTION IsValidPhone(phone : STRING) RETURNS BOOLEAN
+    // Validation: checks the format only; it cannot prove who holds the phone.
+    RETURN LENGTH(phone) = PHONE_LENGTH AND IsAllDigits(phone)
+        AND CONTAINS(validPrefixes, SUBSTRING(phone, 0, 3))
+END FUNCTION
+
+FUNCTION VerifyPhone(phone : STRING) RETURNS BOOLEAN
+    // Verification: proves the caller holds the phone by texting it a one-time code.
+    // The code is a local variable, so it is never stored.
+    DECLARE code, entry : STRING
+    DECLARE tries, elapsed : INTEGER
+    DECLARE sentTime : DATETIME
+    DECLARE sent, verified : BOOLEAN
+    tries ← 0
+    verified ← FALSE
+    code ← PAD_LEFT(RANDOM_INTEGER(0, 999999), 6, "0")
+    sent ← SendSMS(phone, "SaloneMove code: " + code)
+    IF sent = FALSE THEN
+        DISPLAY "Code could not be sent. Please try again later."
+    ELSE
+        sentTime ← GetCurrentDateTime()
+        WHILE tries < MAX_LOGIN_ATTEMPTS AND verified = FALSE DO
+            DISPLAY "Enter the 6-digit code sent to your phone:"
+            INPUT entry
+            elapsed ← SECONDS_BETWEEN(sentTime, GetCurrentDateTime())
+            IF entry = code AND elapsed ≤ CODE_EXPIRY_SECONDS THEN
+                verified ← TRUE
+            ELSE
+                tries ← tries + 1
+                DISPLAY "Wrong or expired code. Attempts left: ", MAX_LOGIN_ATTEMPTS - tries
+            END IF
+        END WHILE
+    END IF
+    RETURN verified
+END FUNCTION
+
+FUNCTION ReadChoice(low : INTEGER, high : INTEGER) RETURNS INTEGER
+    // Shared: reads a menu choice as text and asks again until it is a whole
+    // number from low to high, so letters can never reach TO_INTEGER().
+    DECLARE entry : STRING
+    INPUT entry
+    WHILE NOT IsAllDigits(entry) OR TO_INTEGER(entry) < low
+        OR TO_INTEGER(entry) > high DO
+        DISPLAY "Invalid option. Enter a number from ", low, " to ", high, ":"
+        INPUT entry
+    END WHILE
+    RETURN TO_INTEGER(entry)
+END FUNCTION
+
+// =============== CHECK A FARE (Flowchart 2) ===============
+MODULE CheckFare(phone : STRING)
+    // The officialFare ≤ 0 test stops a damaged record causing division by zero.
+    DECLARE origin, destination, route, status : STRING
+    DECLARE vehicleChoice, index, answer : INTEGER
+    DECLARE official, amountCharged, difference, percent : REAL
+    origin ← ReadPlace("Enter starting point:")
+    destination ← ReadPlace("Enter destination:")
+    DISPLAY "Vehicle: 1. Poda-poda  2. Keke  3. Okada"
+    vehicleChoice ← ReadChoice(1, 3)
+    index ← FindFare(origin, destination, vehicleTypes[vehicleChoice - 1])
+    IF index = -1 THEN
+        DISPLAY "Route not found. Check the spelling or try another vehicle."
+    ELSE IF fareTable[index].officialFare ≤ 0 THEN
+        DISPLAY "Fare record error. Please try again later."
+    ELSE
+        official ← fareTable[index].officialFare
+        route ← fareTable[index].route
+        status ← "NOT CHECKED"
+        DISPLAY "Official fare: NLe ", official
+        DISPLAY "Enter the amount you paid (0 to skip):"
+        amountCharged ← ReadNumber(0, official * MAX_AMOUNT_FACTOR)
+        IF amountCharged > 0 THEN
+            difference ← ROUND(amountCharged - official, 2)
+            percent ← difference / official * 100
+            status ← ClassifyFare(difference, percent)
+            IF status = "CORRECT" THEN
+                DISPLAY "Correct fare."
+            ELSE IF status = "UNDERPAID" THEN
+                DISPLAY "UNDERPAID by NLe ", ABS(difference), ". Please pay the official fare."
+            ELSE
+                DISPLAY status, " by NLe ", difference, " (", ROUND(percent, 0), "%)"
+            END IF
+        END IF
+        DISPLAY "Report a problem with this vehicle?"
+        DISPLAY "1. Yes  2. No"
+        answer ← ReadChoice(1, 2)
+        IF answer = 1 THEN
+            ReportProblem(phone, route, amountCharged, status)
+        END IF
+    END IF
+END MODULE
+
+FUNCTION FindFare(origin : STRING, destination : STRING, vehicleType : STRING) RETURNS INTEGER
+    // Routes are compared in capitals, so "lumley" matches "Lumley".
+    DECLARE forward, reverse : STRING
+    DECLARE i, index : INTEGER
+    DECLARE sameVehicle, sameRoute : BOOLEAN
+    forward ← UPPERCASE(origin + " - " + destination)
+    reverse ← UPPERCASE(destination + " - " + origin)
+    index ← -1
+    i ← 0
+    WHILE i < LENGTH(fareTable) AND index = -1 DO
+        sameVehicle ← fareTable[i].vehicleType = vehicleType
+        sameRoute ← UPPERCASE(fareTable[i].route) = forward
+            OR UPPERCASE(fareTable[i].route) = reverse
+        IF sameVehicle AND sameRoute THEN
+            index ← i
+        END IF
+        i ← i + 1
+    END WHILE
+    RETURN index
+END FUNCTION
+
+FUNCTION ClassifyFare(difference : REAL, percent : REAL) RETURNS STRING
+    // difference = amount paid − official fare. More than NLe 0.50 below is UNDERPAID,
+    // within NLe 0.50 either way is CORRECT, and more than NLe 0.50 above is an overcharge.
+    DECLARE status : STRING
+    IF difference < -FARE_TOLERANCE THEN
+        status ← "UNDERPAID"
+    ELSE IF difference ≤ FARE_TOLERANCE THEN
+        status ← "CORRECT"
+    ELSE IF percent ≥ SERIOUS_PERCENT THEN
+        status ← "SERIOUS OVERCHARGE"
+    ELSE
+        status ← "OVERCHARGED"
+    END IF
+    RETURN status
+END FUNCTION
+
+FUNCTION ReadPlace(prompt : STRING) RETURNS STRING
+    // Shared: asks again until the place name has at least 2 letters and no digits.
+    DECLARE entry : STRING
+    DISPLAY prompt
+    INPUT entry
+    WHILE LENGTH(TRIM(entry)) < MIN_PLACE_LENGTH
+        OR NOT IsLettersAndSpaces(entry) DO
+        DISPLAY "Invalid place name. Use letters only, e.g. Lumley:"
+        INPUT entry
+    END WHILE
+    RETURN TRIM(entry)
+END FUNCTION
+
+FUNCTION ReadNumber(low : REAL, high : REAL) RETURNS REAL
+    // Shared: asks again until the entry is a number from low to high, so text such
+    // as "ten" and typing slips such as 610 for 6.10 are caught.
+    DECLARE entry : STRING
+    INPUT entry
+    WHILE NOT IsNumber(entry) OR TO_REAL(entry) < low
+        OR TO_REAL(entry) > high DO
+        DISPLAY "Invalid number. Enter a value from ", low, " to ", high, ":"
+        INPUT entry
+    END WHILE
+    RETURN ROUND(TO_REAL(entry), 2)
+END FUNCTION
+
+// ============= REPORT A PROBLEM (Flowchart 3) =============
+MODULE ReportProblem(phone : STRING, route : STRING, amountCharged : REAL, fareStatus : STRING)
+    // Overcharging is accepted only when the fare check found an overcharge.
+    DECLARE categoryChoice : INTEGER
+    DECLARE plateNumber, refID : STRING
+    DECLARE overcharged, sent : BOOLEAN
+    DECLARE newComplaint : Complaint
+    overcharged ← fareStatus = "OVERCHARGED"
+        OR fareStatus = "SERIOUS OVERCHARGE"
+    DISPLAY "Problem type: 1. Overcharging"
+    DISPLAY "2. Short-routing  3. Reckless driving"
+    DISPLAY "4. Harassment  5. Overloading"
+    categoryChoice ← ReadChoice(1, 5)
+    IF categoryChoice = 1 AND overcharged = FALSE THEN
+        DISPLAY "Report refused: the fare check did not find an overcharge."
+    ELSE
+        DISPLAY "Enter the vehicle plate number (0 if not seen):"
+        INPUT plateNumber
+        WHILE plateNumber ≠ "0" AND NOT IsValidPlate(plateNumber) DO
+            DISPLAY "Invalid plate number. Enter it again (0 if not seen):"
+            INPUT plateNumber
+        END WHILE
+        reportCounter ← reportCounter + 1
+        refID ← "SLM-" + YEAR(GetCurrentDateTime()) + "-"
+            + PAD_LEFT(reportCounter, 6, "0")
+        newComplaint.referenceID ← refID
+        newComplaint.phoneNumber ← phone
+        newComplaint.plateNumber ← REMOVE_SPACES(UPPERCASE(plateNumber))
+        newComplaint.route ← route
+        newComplaint.category ← categories[categoryChoice - 1]
+        newComplaint.amountCharged ← amountCharged
+        newComplaint.fareStatus ← fareStatus
+        newComplaint.dateTime ← GetCurrentDateTime()
+        newComplaint.status ← "OPEN"
+        ADD newComplaint TO complaints
+        sent ← SendSMS(phone, "SaloneMove: Report received. Ref: " + refID)
+        IF sent = FALSE THEN
+            DISPLAY "SMS not sent. Please write down your reference."
+        END IF
+        DISPLAY "Thank you. Your reference number is ", refID
+    END IF
+END MODULE
+
+FUNCTION IsValidPlate(plate : STRING) RETURNS BOOLEAN
+    DECLARE cleaned : STRING
+    cleaned ← REMOVE_SPACES(UPPERCASE(plate))
+    RETURN LENGTH(cleaned) ≥ 5 AND LENGTH(cleaned) ≤ 8
+        AND IsLettersAndDigits(cleaned)
+END FUNCTION
+
+// ============== OFFICER PORTAL (Flowchart 4) ==============
+MODULE OfficerPortal(phone : STRING)
+    // Three wrong PINs lock the portal for that phone number, so the PIN
+    // cannot be found by guessing.
+    DECLARE pin : STRING
+    DECLARE officerChoice, tries : INTEGER
+    DECLARE inPortal : BOOLEAN
+    tries ← 0
+    inPortal ← FALSE
+    IF CONTAINS(lockedNumbers, phone) THEN
+        DISPLAY "Officer login is locked for this number."
+    ELSE
+        WHILE tries < MAX_LOGIN_ATTEMPTS AND inPortal = FALSE DO
+            DISPLAY "Enter officer PIN:"
+            INPUT pin
+            IF HASH(pin) = officerPINHash THEN
+                inPortal ← TRUE
+            ELSE
+                tries ← tries + 1
+                DISPLAY "Wrong PIN. Attempts left: ", MAX_LOGIN_ATTEMPTS - tries
+            END IF
+        END WHILE
+        IF inPortal = FALSE THEN
+            ADD phone TO lockedNumbers
+            DISPLAY "Access denied. Officer login locked for this number."
+        END IF
+        WHILE inPortal = TRUE DO
+            DISPLAY "1. Hotspot Report"
+            DISPLAY "2. Apply Fare Change"
+            DISPLAY "0. Back"
+            officerChoice ← ReadChoice(0, 2)
+            IF officerChoice = 1 THEN
+                GenerateHotspotReport()
+            ELSE IF officerChoice = 2 THEN
+                ApplyFareAdjustment()
+            ELSE
+                inPortal ← FALSE
+            END IF
+        END WHILE
+    END IF
+END MODULE
+
+MODULE GenerateHotspotReport()
+    DECLARE r, c, count, hotspotCount : INTEGER
+    DECLARE openOnRoute : BOOLEAN
+    hotspotCount ← 0
+    FOR r ← 0 TO LENGTH(routeList) - 1 DO
+        count ← 0
+        FOR c ← 0 TO LENGTH(complaints) - 1 DO
+            openOnRoute ← complaints[c].route = routeList[r]
+                AND complaints[c].status = "OPEN"
+            IF openOnRoute THEN
+                count ← count + 1
+            END IF
+        END FOR
+        IF count ≥ HOTSPOT_THRESHOLD THEN
+            DISPLAY routeList[r], ": ", count, " open complaints - HOTSPOT"
+            hotspotCount ← hotspotCount + 1
+        END IF
+    END FOR
+    IF hotspotCount = 0 THEN
+        DISPLAY "No hotspots this period."
+    ELSE
+        DISPLAY "Total hotspots: ", hotspotCount
+    END IF
+END MODULE
+
+MODULE ApplyFareAdjustment()
+    // ReadNumber() keeps the change within ±50%, so no fare can fall to 0.
+    DECLARE percentChange : REAL
+    DECLARE confirm, i : INTEGER
+    DISPLAY "Fare change in % (e.g. 9.4 or -12.5):"
+    percentChange ← ReadNumber(-MAX_FARE_CHANGE, MAX_FARE_CHANGE)
+    IF percentChange = 0 THEN
+        DISPLAY "Rejected: the change cannot be 0%."
+    ELSE
+        DISPLAY "Apply ", percentChange, "% to all fares?"
+        DISPLAY "1. Yes  2. No"
+        confirm ← ReadChoice(1, 2)
+        IF confirm = 1 THEN
+            FOR i ← 0 TO LENGTH(fareTable) - 1 DO
+                fareTable[i].officialFare ← ROUND(fareTable[i].officialFare
+                    * (1 + percentChange / 100), 2)
+            END FOR
+            DISPLAY LENGTH(fareTable), " fares updated."
+        ELSE
+            DISPLAY "No changes made."
+        END IF
+    END IF
+END MODULE
+
+END PROGRAM
